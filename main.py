@@ -11,6 +11,9 @@ import numpy as np
 import tkinter as tk
 from tkinter import ttk, filedialog, messagebox
 
+import random
+import albumentations as A
+
 from PIL import Image, ImageTk, ImageEnhance
 
 # Optional but recommended for camera capture
@@ -26,6 +29,18 @@ try:
 except Exception:
     YOLOE = None
     YOLOEVPSegPredictor = None
+
+# RFDETR for training
+try:
+    from training import rfdetr_train
+except Exception:
+    rfdetr_train = None
+
+# RFDETR for inference
+try:
+    from rfdetr import RFDETRBase
+except Exception:
+    RFDETRBase = None
 
 
 IMG_EXTS = {".jpg", ".jpeg", ".png", ".bmp", ".tif", ".tiff", ".webp"}
@@ -333,14 +348,20 @@ class App(tk.Tk):
         self.screen_import = ttk.Frame(self.nb)
         self.screen_label = ttk.Frame(self.nb)
         self.screen_output = ttk.Frame(self.nb)
+        self.screen_training = ttk.Frame(self.nb)
+        self.screen_validation = ttk.Frame(self.nb)
 
         self.nb.add(self.screen_import, text="1) Import")
         self.nb.add(self.screen_label, text="2) Labeling")
         self.nb.add(self.screen_output, text="3) Output")
+        self.nb.add(self.screen_training, text="4) Training")
+        self.nb.add(self.screen_validation, text="5) Validation")
 
         self._build_import()
         self._build_labeling()
         self._build_output()
+        self._build_training()
+        self._build_validation()
 
         # status bar
         sb = ttk.Frame(self)
@@ -368,7 +389,7 @@ class App(tk.Tk):
         ttk.Button(btns, text="Add files…", command=self._import_files).grid(row=0, column=1, padx=(0, 8))
         ttk.Button(btns, text="Clear list", command=self._clear_images).grid(row=0, column=2)
 
-        cam = ttk.Labelframe(frm, text="Camera capture (optional)")
+        cam = ttk.Labelframe(frm, text="Video frame extraction (optional)")
         cam.grid(row=1, column=0, sticky="ew", padx=12, pady=12)
         for i in range(6):
             cam.columnconfigure(i, weight=(1 if i == 5 else 0))
@@ -382,12 +403,12 @@ class App(tk.Tk):
         self.cam_interval_var = tk.DoubleVar(value=2.0)
         ttk.Entry(cam, textvariable=self.cam_interval_var, width=10).grid(row=1, column=1, sticky="w", padx=8, pady=8)
 
-        self.cam_index_var = tk.IntVar(value=0)
-        ttk.Label(cam, text="Camera index:").grid(row=1, column=2, sticky="w", padx=8, pady=8)
-        ttk.Entry(cam, textvariable=self.cam_index_var, width=8).grid(row=1, column=3, sticky="w", padx=8, pady=8)
-
-        ttk.Button(cam, text="Start capture", command=self._start_camera_capture).grid(row=1, column=4, padx=8, pady=8, sticky="e")
-        ttk.Button(cam, text="Stop", command=self._stop_camera_capture).grid(row=1, column=5, padx=8, pady=8, sticky="e")
+        ttk.Button(cam, text="Upload video…", command=self._upload_video_for_extraction).grid(row=1, column=2, padx=8, pady=8, sticky="e")
+        ttk.Button(cam, text="Extract frames", command=self._extract_video_frames).grid(row=1, column=3, padx=8, pady=8, sticky="e")
+        
+        self.video_path_var = tk.StringVar(value="")
+        ttk.Label(cam, text="Video:").grid(row=2, column=0, sticky="w", padx=8, pady=8)
+        ttk.Label(cam, textvariable=self.video_path_var, foreground="gray").grid(row=2, column=1, columnspan=4, sticky="w", padx=8, pady=8)
 
         # imported list preview
         mid = ttk.Frame(frm)
@@ -411,6 +432,71 @@ class App(tk.Tk):
         d = filedialog.askdirectory(title="Select capture output folder")
         if d:
             self.cam_out_var.set(d)
+
+    def _upload_video_for_extraction(self):
+        if cv2 is None:
+            messagebox.showerror("OpenCV missing", "Install opencv-python to use video extraction.")
+            return
+        path = filedialog.askopenfilename(
+            title="Select video file",
+            filetypes=[("Video files", "*.mp4 *.avi *.mov *.mkv *.flv *.wmv"), ("All files", "*.*")]
+        )
+        if path:
+            self.video_path_var.set(path)
+
+    def _extract_video_frames(self):
+        if cv2 is None:
+            messagebox.showerror("OpenCV missing", "Install opencv-python to use video extraction.")
+            return
+        video_path = self.video_path_var.get().strip()
+        if not video_path or not os.path.exists(video_path):
+            messagebox.showwarning("No video", "Please upload a video file first.")
+            return
+        
+        out_dir = self.cam_out_var.get().strip()
+        ensure_dir(out_dir)
+        interval = float(self.cam_interval_var.get())
+        
+        if interval <= 0:
+            messagebox.showerror("Invalid interval", "Interval must be greater than 0.")
+            return
+        
+        def extract_worker():
+            try:
+                self._status.set("Extracting frames from video...")
+                cap = cv2.VideoCapture(video_path)
+                if not cap.isOpened():
+                    self.after(0, lambda: messagebox.showerror("Error", "Failed to open video file."))
+                    return
+                
+                fps = cap.get(cv2.CAP_PROP_FPS)
+                frame_interval = int(fps * interval)
+                frame_count = 0
+                saved_count = 0
+                
+                while True:
+                    ret, frame = cap.read()
+                    if not ret:
+                        break
+                    
+                    if frame_count % frame_interval == 0:
+                        ts = time.strftime("%Y%m%d_%H%M%S")
+                        fn = os.path.join(out_dir, f"frame_{ts}_{saved_count:06d}.jpg")
+                        cv2.imwrite(fn, frame)
+                        self.after(0, lambda p=fn: self._add_images([p]))
+                        saved_count += 1
+                    
+                    frame_count += 1
+                
+                cap.release()
+                self.after(0, lambda: self._status.set(f"Extracted {saved_count} frames from video."))
+                self.after(0, lambda: messagebox.showinfo("Complete", f"Extracted {saved_count} frames to:\n{out_dir}"))
+            except Exception as e:
+                self.after(0, lambda: messagebox.showerror("Error", f"Failed to extract frames: {str(e)}"))
+                self.after(0, lambda: self._status.set("Frame extraction failed."))
+        
+        thread = threading.Thread(target=extract_worker, daemon=True)
+        thread.start()
 
     def _import_folder(self):
         folder = filedialog.askdirectory(title="Select image folder")
@@ -436,43 +522,6 @@ class App(tk.Tk):
         self.viewer.set_image(None)
         self._status.set("Cleared.")
 
-    def _start_camera_capture(self):
-        if cv2 is None:
-            messagebox.showerror("OpenCV missing", "Install opencv-python to use camera capture.")
-            return
-        if self._cam_running:
-            return
-
-        out_dir = self.cam_out_var.get().strip()
-        ensure_dir(out_dir)
-        interval = float(self.cam_interval_var.get())
-        cam_idx = int(self.cam_index_var.get())
-
-        self._cam_running = True
-
-        def loop():
-            cap = cv2.VideoCapture(cam_idx)
-            if not cap.isOpened():
-                self._status.set("Camera failed to open.")
-                self._cam_running = False
-                return
-            self._status.set("Camera capture running...")
-            while self._cam_running:
-                ret, frame = cap.read()
-                if ret:
-                    ts = time.strftime("%Y%m%d_%H%M%S")
-                    fn = os.path.join(out_dir, f"cap_{ts}_{int(time.time()*1000)%1000:03d}.jpg")
-                    cv2.imwrite(fn, frame)
-                    self.after(0, lambda p=fn: self._add_images([p]))
-                time.sleep(max(0.05, interval))
-            cap.release()
-            self.after(0, lambda: self._status.set("Camera capture stopped."))
-
-        self._cam_thread = threading.Thread(target=loop, daemon=True)
-        self._cam_thread.start()
-
-    def _stop_camera_capture(self):
-        self._cam_running = False
 
     # ----------------------------
     # Screen 2: Labeling
@@ -779,46 +828,169 @@ class App(tk.Tk):
 
         def worker():
             try:
-                self._status.set("Loading YOLOE model...")
+                # Determine device (GPU if available)
+                device = None
+                device_name = "CPU"
+                gpu_info = ""
+                try:
+                    import torch
+                    if torch.cuda.is_available():
+                        device = "cuda"
+                        gpu_name = torch.cuda.get_device_name(0)
+                        gpu_memory = torch.cuda.get_device_properties(0).total_memory / (1024**3)  # GB
+                        device_name = f"GPU ({gpu_name}, {gpu_memory:.1f}GB)"
+                        gpu_info = f"\nGPU: {gpu_name}\nGPU Memory: {gpu_memory:.1f}GB\nCUDA Version: {torch.version.cuda}"
+                    else:
+                        device = "cpu"
+                        device_name = "CPU"
+                        # Check why CUDA is not available
+                        if not torch.cuda.is_available():
+                            gpu_info = "\nCUDA is not available. Possible reasons:\n"
+                            gpu_info += "- PyTorch was installed without CUDA support\n"
+                            gpu_info += "- CUDA drivers are not installed\n"
+                            gpu_info += "- GPU is not detected by PyTorch\n"
+                            gpu_info += f"PyTorch version: {torch.__version__}"
+                except ImportError:
+                    device = "cpu"
+                    device_name = "CPU"
+                    gpu_info = "\nPyTorch not found. Install torch to enable GPU support."
+                
+                self._status.set(f"Loading YOLOE model on {device_name}...")
                 if self._yoloe_model is None:
-                    self._yoloe_model = YOLOE(MODEL_PATH)
+                    # Try to initialize YOLOE with device parameter
+                    try:
+                        # Ultralytics YOLO models typically accept device during initialization
+                        self._yoloe_model = YOLOE(MODEL_PATH, device=device)
+                    except TypeError:
+                        # If device parameter not supported, initialize normally and try to set device
+                        self._yoloe_model = YOLOE(MODEL_PATH)
+                        # Try to set device after initialization
+                        if device == "cuda":
+                            try:
+                                if hasattr(self._yoloe_model, 'to'):
+                                    self._yoloe_model.to(device)
+                                elif hasattr(self._yoloe_model, 'model'):
+                                    # Some models have a nested model attribute
+                                    if hasattr(self._yoloe_model.model, 'to'):
+                                        self._yoloe_model.model.to(device)
+                            except Exception as e:
+                                # If setting device fails, log but continue
+                                self.after(0, lambda: self._status.set(f"Warning: Could not set device to GPU: {str(e)}"))
+                
+                # Log which device is being used
+                self.after(0, lambda: self._status.set(f"Using {device_name} for autolabeling..."))
 
-                # Apply auto labels per image
-                for i, item in enumerate(self.images):
+                # Get the set of labels we're currently processing
+                current_prompt_labels = set(labels)
+
+                # Remove only auto boxes that match the current prompt labels (not all auto boxes)
+                # This preserves manual boxes and auto boxes from other label sets
+                for item in self.images:
+                    item.boxes = [b for b in item.boxes if not (b.kind == "auto" and b.label in current_prompt_labels)]
+
+                # Batch processing for speed
+                batch_size = 8  # Process 8 images at a time
+                total_images = len(self.images)
+                
+                # Process images in batches
+                for batch_start in range(0, total_images, batch_size):
                     if self._stop_autolabel:
                         break
+                    
+                    batch_end = min(batch_start + batch_size, total_images)
+                    batch_items = self.images[batch_start:batch_end]
+                    batch_paths = [item.path for item in batch_items]
+                    
+                    num_batches = (total_images + batch_size - 1) // batch_size
+                    current_batch = batch_start // batch_size + 1
+                    self._status.set(f"Auto-labeling batch {current_batch}/{num_batches} ({batch_start+1}-{batch_end}/{total_images})...")
+                    
+                    # Process batch - YOLOE can handle lists of images
+                    # Device is already set during model initialization, so we don't need to pass it to predict
+                    try:
+                        results = self._yoloe_model.predict(
+                            batch_paths,
+                            refer_image=refer_image,
+                            visual_prompts=visual_prompts,
+                            predictor=YOLOEVPSegPredictor,
+                            conf=conf,
+                            iou=iou,
+                            verbose=False,
+                        )
+                    except Exception as e:
+                        # Fallback to individual processing if batch fails
+                        self.after(0, lambda: self._status.set(f"Batch processing failed, using individual processing..."))
+                        results = []
+                        for path in batch_paths:
+                            result = self._yoloe_model.predict(
+                                path,
+                                refer_image=refer_image,
+                                visual_prompts=visual_prompts,
+                                predictor=YOLOEVPSegPredictor,
+                                conf=conf,
+                                iou=iou,
+                                verbose=False,
+                            )
+                            results.extend(result)
 
-                    # Remove previous auto boxes for this label set (optional)
-                    item.boxes = [b for b in item.boxes if b.kind != "auto"]
+                    # Process results for each image in the batch
+                    for i, (item, result) in enumerate(zip(batch_items, results)):
+                        if not hasattr(result, "boxes") or result.boxes is None:
+                            continue
 
-                    self._status.set(f"Auto-labeling {i+1}/{len(self.images)}: {os.path.basename(item.path)}")
-                    results = self._yoloe_model.predict(
-                        item.path,
-                        refer_image=refer_image,
-                        visual_prompts=visual_prompts,
-                        predictor=YOLOEVPSegPredictor,
-                        conf=conf,
-                        iou=iou,
-                        verbose=False,
-                    )
-                    r0 = results[0]
-                    if not hasattr(r0, "boxes") or r0.boxes is None:
-                        continue
+                        # Get boxes from result
+                        if hasattr(result.boxes, 'xyxy'):
+                            xyxy = result.boxes.xyxy
+                            if hasattr(xyxy, 'cpu'):
+                                xyxy = xyxy.cpu().numpy()
+                            else:
+                                xyxy = np.array(xyxy)
+                        else:
+                            continue
 
-                    xyxy = r0.boxes.xyxy.cpu().numpy()
-                    c = r0.boxes.cls.cpu().numpy().astype(int)  # these are the sequential ids
-                    for (x1, y1, x2, y2), cid in zip(xyxy, c):
-                        lab = seq_to_label.get(int(cid), int(cid))
-                        item.boxes.append(Box(float(x1), float(y1), float(x2), float(y2), label=lab, kind="auto"))
+                        if hasattr(result.boxes, 'cls'):
+                            c = result.boxes.cls
+                            if hasattr(c, 'cpu'):
+                                c = c.cpu().numpy().astype(int)
+                            else:
+                                c = np.array(c).astype(int)
+                        else:
+                            continue
 
-                    # refresh current display
-                    if self.cur_index == i:
-                        self.after(0, self._refresh_viewer)
+                        # Add new auto boxes
+                        for (x1, y1, x2, y2), cid in zip(xyxy, c):
+                            lab = seq_to_label.get(int(cid), int(cid))
+                            item.boxes.append(Box(float(x1), float(y1), float(x2), float(y2), label=lab, kind="auto"))
 
-                self.after(0, lambda: self._status.set("Auto-label done."))
+                        # Refresh current display if this is the current image
+                        idx = batch_start + i
+                        if self.cur_index == idx:
+                            self.after(0, self._refresh_viewer)
+
+                # Show completion alert
+                def show_completion():
+                    self._status.set("Auto-label done.")
+                    # Bring window to front
+                    self.lift()
+                    self.attributes('-topmost', True)
+                    self.after_idle(lambda: self.attributes('-topmost', False))
+                    # Show messagebox with device info
+                    msg = f"Autolabeling finished successfully!\n\n"
+                    msg += f"Processed {total_images} images using {device_name}."
+                    if device == "cpu" and gpu_info:
+                        msg += f"\n\n{gpu_info}"
+                    messagebox.showinfo("Autolabeling Complete", msg)
+                
+                self.after(0, show_completion)
             except Exception as e:
-                self.after(0, lambda: messagebox.showerror("Auto-label error", str(e)))
-                self.after(0, lambda: self._status.set("Auto-label failed."))
+                def show_error():
+                    self._status.set("Auto-label failed.")
+                    # Bring window to front
+                    self.lift()
+                    self.attributes('-topmost', True)
+                    self.after_idle(lambda: self.attributes('-topmost', False))
+                    messagebox.showerror("Auto-label error", str(e))
+                self.after(0, show_error)
 
         self._autolabel_thread = threading.Thread(target=worker, daemon=True)
         self._autolabel_thread.start()
@@ -854,37 +1026,562 @@ class App(tk.Tk):
         ttk.Radiobutton(out, text="COCO .json", value="coco", variable=self.format_var).grid(row=1, column=2, sticky="w", padx=8)
         ttk.Radiobutton(out, text="Pascal VOC .xml", value="voc", variable=self.format_var).grid(row=1, column=3, sticky="w", padx=8)
 
-        aug = ttk.Labelframe(frm, text="Augmentations (optional)")
+        aug = ttk.Labelframe(frm, text="Albumentations augmentations")
         aug.grid(row=2, column=0, sticky="nsew", padx=12, pady=12)
         aug.columnconfigure(0, weight=1)
 
-        self.aug_hflip = tk.BooleanVar(value=False)
-        self.aug_vflip = tk.BooleanVar(value=False)
-        self.aug_rot90 = tk.BooleanVar(value=False)
-        self.aug_rot180 = tk.BooleanVar(value=False)
-        self.aug_rot270 = tk.BooleanVar(value=False)
-        self.aug_bright = tk.BooleanVar(value=False)
+        row = ttk.Frame(aug)
+        row.pack(fill="x", padx=8, pady=8)
 
+        self.albu_enable = tk.BooleanVar(value=True)
+        ttk.Checkbutton(row, text="Enable Albumentations", variable=self.albu_enable).grid(row=0, column=0, sticky="w")
+
+        ttk.Label(row, text="Num augmented copies per image:").grid(row=0, column=1, sticky="e", padx=(12, 6))
+        self.albu_copies = tk.IntVar(value=2)
+        ttk.Entry(row, textvariable=self.albu_copies, width=6).grid(row=0, column=2, sticky="w")
+
+        # Common transforms
         grid = ttk.Frame(aug)
         grid.pack(fill="x", padx=8, pady=8)
 
-        ttk.Checkbutton(grid, text="Horizontal flip", variable=self.aug_hflip).grid(row=0, column=0, sticky="w", padx=6, pady=4)
-        ttk.Checkbutton(grid, text="Vertical flip", variable=self.aug_vflip).grid(row=0, column=1, sticky="w", padx=6, pady=4)
-        ttk.Checkbutton(grid, text="Rotate 90", variable=self.aug_rot90).grid(row=1, column=0, sticky="w", padx=6, pady=4)
-        ttk.Checkbutton(grid, text="Rotate 180", variable=self.aug_rot180).grid(row=1, column=1, sticky="w", padx=6, pady=4)
-        ttk.Checkbutton(grid, text="Rotate 270", variable=self.aug_rot270).grid(row=1, column=2, sticky="w", padx=6, pady=4)
+        self.albu_geom = tk.BooleanVar(value=True)
+        self.albu_color = tk.BooleanVar(value=True)
+        self.albu_noise_blur = tk.BooleanVar(value=True)
+        self.albu_dropout = tk.BooleanVar(value=False)
+        self.albu_safe_crop = tk.BooleanVar(value=True)
 
-        ttk.Checkbutton(grid, text="Brightness jitter", variable=self.aug_bright).grid(row=2, column=0, sticky="w", padx=6, pady=4)
-        ttk.Label(grid, text="Brightness factor (e.g., 0.8 or 1.2):").grid(row=2, column=1, sticky="e", padx=6, pady=4)
-        self.bright_factor_var = tk.DoubleVar(value=1.2)
-        ttk.Entry(grid, textvariable=self.bright_factor_var, width=8).grid(row=2, column=2, sticky="w", padx=6, pady=4)
+        ttk.Checkbutton(grid, text="Geometric (flip/rotate/affine/perspective)", variable=self.albu_geom).grid(row=0, column=0, sticky="w", padx=6, pady=4)
+        ttk.Checkbutton(grid, text="Color (HSV/brightness/contrast/gamma/CLAHE)", variable=self.albu_color).grid(row=0, column=1, sticky="w", padx=6, pady=4)
+        ttk.Checkbutton(grid, text="Noise/blur/compression", variable=self.albu_noise_blur).grid(row=1, column=0, sticky="w", padx=6, pady=4)
+        ttk.Checkbutton(grid, text="Dropout (coarse dropout/cutout-like)", variable=self.albu_dropout).grid(row=1, column=1, sticky="w", padx=6, pady=4)
+        ttk.Checkbutton(grid, text="Safe crop (bbox aware)", variable=self.albu_safe_crop).grid(row=2, column=0, sticky="w", padx=6, pady=4)
 
-        note = ttk.Label(
-            aug,
-            text=("Tip: augmentations create extra images + transformed labels; only simple geometry ops are included here.\n"
-                  "If you want mosaic/cutout/HSV/noise, it’s best to integrate Albumentations later."),
+        # Mosaic
+        mrow = ttk.Frame(aug)
+        mrow.pack(fill="x", padx=8, pady=(8, 4))
+
+        self.albu_mosaic = tk.BooleanVar(value=False)
+        ttk.Checkbutton(mrow, text="Enable Mosaic", variable=self.albu_mosaic).pack(side="left")
+
+        ttk.Label(mrow, text="Mosaic prob:").pack(side="left", padx=(12, 6))
+        self.albu_mosaic_p = tk.DoubleVar(value=0.3)
+        ttk.Entry(mrow, textvariable=self.albu_mosaic_p, width=6).pack(side="left")
+
+        ttk.Label(mrow, text="Grid (y,x):").pack(side="left", padx=(12, 6))
+        self.albu_mosaic_gy = tk.IntVar(value=2)
+        self.albu_mosaic_gx = tk.IntVar(value=2)
+        ttk.Entry(mrow, textvariable=self.albu_mosaic_gy, width=4).pack(side="left")
+        ttk.Entry(mrow, textvariable=self.albu_mosaic_gx, width=4).pack(side="left", padx=(4, 0))
+
+        ttk.Label(mrow, text="Target size:").pack(side="left", padx=(12, 6))
+        self.albu_mosaic_ts = tk.IntVar(value=1024)
+        ttk.Entry(mrow, textvariable=self.albu_mosaic_ts, width=6).pack(side="left")
+
+    # ----------------------------
+    # Screen 4: Training
+    # ----------------------------
+    def _build_training(self):
+        frm = self.screen_training
+        frm.columnconfigure(0, weight=1)
+        frm.rowconfigure(1, weight=1)
+
+        top = ttk.Frame(frm)
+        top.grid(row=0, column=0, sticky="ew", padx=12, pady=12)
+        top.columnconfigure(1, weight=1)
+
+        ttk.Label(top, text="RF-DETR Model Training", font=("Segoe UI", 14, "bold")).grid(row=0, column=0, sticky="w")
+
+        settings = ttk.Labelframe(frm, text="Training Settings")
+        settings.grid(row=1, column=0, sticky="nsew", padx=12, pady=12)
+        settings.columnconfigure(1, weight=1)
+
+        # Dataset path
+        ttk.Label(settings, text="Dataset path:").grid(row=0, column=0, sticky="w", padx=8, pady=8)
+        self.train_dataset_var = tk.StringVar(value="")
+        ttk.Entry(settings, textvariable=self.train_dataset_var).grid(row=0, column=1, sticky="ew", padx=8, pady=8)
+        ttk.Button(settings, text="Browse…", command=self._pick_train_dataset).grid(row=0, column=2, padx=8, pady=8)
+
+        # Output directory
+        ttk.Label(settings, text="Output directory:").grid(row=1, column=0, sticky="w", padx=8, pady=8)
+        self.train_output_var = tk.StringVar(value=os.path.abspath("./models"))
+        ttk.Entry(settings, textvariable=self.train_output_var).grid(row=1, column=1, sticky="ew", padx=8, pady=8)
+        ttk.Button(settings, text="Browse…", command=self._pick_train_output).grid(row=1, column=2, padx=8, pady=8)
+
+        # Engine output filename
+        ttk.Label(settings, text="Engine filename:").grid(row=2, column=0, sticky="w", padx=8, pady=8)
+        self.train_engine_var = tk.StringVar(value="trained_rfdetr.engine")
+        ttk.Entry(settings, textvariable=self.train_engine_var).grid(row=2, column=1, sticky="ew", padx=8, pady=8)
+
+        # Training parameters
+        params = ttk.Labelframe(settings, text="Training Parameters")
+        params.grid(row=3, column=0, columnspan=3, sticky="ew", padx=8, pady=8)
+        params.columnconfigure(1, weight=1)
+        params.columnconfigure(3, weight=1)
+
+        ttk.Label(params, text="Epochs:").grid(row=0, column=0, sticky="w", padx=8, pady=4)
+        self.train_epochs_var = tk.IntVar(value=100)
+        ttk.Entry(params, textvariable=self.train_epochs_var, width=10).grid(row=0, column=1, sticky="w", padx=8, pady=4)
+
+        ttk.Label(params, text="Batch size:").grid(row=0, column=2, sticky="w", padx=8, pady=4)
+        self.train_batch_var = tk.IntVar(value=4)
+        ttk.Entry(params, textvariable=self.train_batch_var, width=10).grid(row=0, column=3, sticky="w", padx=8, pady=4)
+
+        ttk.Label(params, text="Learning rate:").grid(row=1, column=0, sticky="w", padx=8, pady=4)
+        self.train_lr_var = tk.DoubleVar(value=1e-4)
+        ttk.Entry(params, textvariable=self.train_lr_var, width=10).grid(row=1, column=1, sticky="w", padx=8, pady=4)
+
+        ttk.Label(params, text="Grad accum steps:").grid(row=1, column=2, sticky="w", padx=8, pady=4)
+        self.train_grad_accum_var = tk.IntVar(value=4)
+        ttk.Entry(params, textvariable=self.train_grad_accum_var, width=10).grid(row=1, column=3, sticky="w", padx=8, pady=4)
+
+        ttk.Label(params, text="Workspace size (MB):").grid(row=2, column=0, sticky="w", padx=8, pady=4)
+        self.train_workspace_var = tk.IntVar(value=4096)
+        ttk.Entry(params, textvariable=self.train_workspace_var, width=10).grid(row=2, column=1, sticky="w", padx=8, pady=4)
+
+        # Training status
+        status_frame = ttk.Frame(settings)
+        status_frame.grid(row=4, column=0, columnspan=3, sticky="ew", padx=8, pady=8)
+        status_frame.columnconfigure(0, weight=1)
+
+        self.train_status_var = tk.StringVar(value="Ready to train")
+        ttk.Label(status_frame, textvariable=self.train_status_var, foreground="gray").grid(row=0, column=0, sticky="w")
+
+        # Progress bar
+        self.train_progress_var = tk.DoubleVar(value=0.0)
+        self.train_progress = ttk.Progressbar(status_frame, variable=self.train_progress_var, maximum=100.0, length=300)
+        self.train_progress.grid(row=1, column=0, sticky="ew", pady=(4, 0))
+        self.train_progress.grid_remove()  # Hide initially
+
+        # Start training button
+        ttk.Button(settings, text="Start Training", command=self._start_training).grid(row=5, column=0, columnspan=3, padx=8, pady=12)
+
+        self._training_thread = None
+        self._stop_training = False
+
+    def _pick_train_dataset(self):
+        d = filedialog.askdirectory(title="Select dataset folder (COCO format)")
+        if d:
+            self.train_dataset_var.set(d)
+
+    def _pick_train_output(self):
+        d = filedialog.askdirectory(title="Select output directory")
+        if d:
+            self.train_output_var.set(d)
+
+    def _start_training(self):
+        if rfdetr_train is None:
+            messagebox.showerror("Training module missing", "Could not import training module.")
+            return
+        
+        dataset_path = self.train_dataset_var.get().strip()
+        if not dataset_path or not os.path.exists(dataset_path):
+            messagebox.showwarning("Invalid dataset", "Please select a valid dataset folder.")
+            return
+
+        output_dir = self.train_output_var.get().strip()
+        engine_output = self.train_engine_var.get().strip()
+        if not engine_output:
+            messagebox.showwarning("Invalid engine name", "Please specify an engine filename.")
+            return
+
+        epochs = int(self.train_epochs_var.get())
+        batch_size = int(self.train_batch_var.get())
+        lr = float(self.train_lr_var.get())
+        grad_accum = int(self.train_grad_accum_var.get())
+        workspace_size = int(self.train_workspace_var.get())
+
+        if self._training_thread and self._training_thread.is_alive():
+            messagebox.showinfo("Training in progress", "Training is already running.")
+            return
+
+        self._stop_training = False
+
+        def training_worker():
+            try:
+                # Show progress bar and reset
+                self.after(0, lambda: self.train_progress.grid())
+                self.after(0, lambda: self.train_progress_var.set(0.0))
+                self.after(0, lambda: self.train_progress.configure(mode='indeterminate'))
+                self.after(0, lambda: self.train_progress.start(10))  # Start indeterminate progress
+                self.after(0, lambda: self.train_status_var.set("Training started..."))
+                self.after(0, lambda: self._status.set("Training RF-DETR model..."))
+                
+                engine_path = rfdetr_train(
+                    dataset_path=dataset_path,
+                    output_dir=output_dir,
+                    engine_output=engine_output,
+                    epochs=epochs,
+                    batch_size=batch_size,
+                    grad_accum_steps=grad_accum,
+                    lr=lr,
+                    workspace_size=workspace_size
+                )
+                
+                # Stop progress bar and hide it
+                self.after(0, lambda: self.train_progress.stop())
+                self.after(0, lambda: self.train_progress.grid_remove())
+                self.after(0, lambda: self.train_progress_var.set(100.0))
+                self.after(0, lambda: self.train_status_var.set(f"Training complete! Engine saved to: {engine_path}"))
+                self.after(0, lambda: self._status.set("Training completed successfully."))
+                self.after(0, lambda: messagebox.showinfo("Training Complete", f"Model trained and exported to:\n{engine_path}"))
+            except Exception as e:
+                # Stop progress bar on error
+                error_msg = str(e)  # Capture error message for lambda
+                self.after(0, lambda: self.train_progress.stop())
+                self.after(0, lambda: self.train_progress.grid_remove())
+                self.after(0, lambda msg=error_msg: self.train_status_var.set(f"Training failed: {msg}"))
+                self.after(0, lambda: self._status.set("Training failed."))
+                self.after(0, lambda msg=error_msg: messagebox.showerror("Training Error", f"An error occurred during training:\n{msg}"))
+
+        self._training_thread = threading.Thread(target=training_worker, daemon=True)
+        self._training_thread.start()
+
+    # ----------------------------
+    # Screen 5: Validation
+    # ----------------------------
+    def _build_validation(self):
+        frm = self.screen_validation
+        frm.columnconfigure(0, weight=1)
+        frm.rowconfigure(1, weight=1)
+
+        top = ttk.Frame(frm)
+        top.grid(row=0, column=0, sticky="ew", padx=12, pady=12)
+        top.columnconfigure(1, weight=1)
+
+        ttk.Label(top, text="Model Validation", font=("Segoe UI", 14, "bold")).grid(row=0, column=0, sticky="w")
+
+        settings = ttk.Labelframe(frm, text="Validation Settings")
+        settings.grid(row=1, column=0, sticky="nsew", padx=12, pady=12)
+        settings.columnconfigure(1, weight=1)
+
+        # Model engine path
+        ttk.Label(settings, text="Model engine file:").grid(row=0, column=0, sticky="w", padx=8, pady=8)
+        self.val_model_var = tk.StringVar(value="")
+        ttk.Entry(settings, textvariable=self.val_model_var).grid(row=0, column=1, sticky="ew", padx=8, pady=8)
+        ttk.Button(settings, text="Browse…", command=self._pick_val_model).grid(row=0, column=2, padx=8, pady=8)
+
+        # Video path
+        ttk.Label(settings, text="Test video:").grid(row=1, column=0, sticky="w", padx=8, pady=8)
+        self.val_video_var = tk.StringVar(value="")
+        ttk.Entry(settings, textvariable=self.val_video_var).grid(row=1, column=1, sticky="ew", padx=8, pady=8)
+        ttk.Button(settings, text="Browse…", command=self._pick_val_video).grid(row=1, column=2, padx=8, pady=8)
+
+        # Output video path
+        ttk.Label(settings, text="Output video:").grid(row=2, column=0, sticky="w", padx=8, pady=8)
+        self.val_output_var = tk.StringVar(value=os.path.abspath("./validation_output.mp4"))
+        ttk.Entry(settings, textvariable=self.val_output_var).grid(row=2, column=1, sticky="ew", padx=8, pady=8)
+        ttk.Button(settings, text="Browse…", command=self._pick_val_output).grid(row=2, column=2, padx=8, pady=8)
+
+        # Confidence threshold
+        ttk.Label(settings, text="Confidence threshold:").grid(row=3, column=0, sticky="w", padx=8, pady=8)
+        self.val_conf_var = tk.DoubleVar(value=0.25)
+        ttk.Entry(settings, textvariable=self.val_conf_var, width=10).grid(row=3, column=1, sticky="w", padx=8, pady=8)
+
+        # Validation status
+        status_frame = ttk.Frame(settings)
+        status_frame.grid(row=4, column=0, columnspan=3, sticky="ew", padx=8, pady=8)
+        status_frame.columnconfigure(0, weight=1)
+
+        self.val_status_var = tk.StringVar(value="Ready to validate")
+        ttk.Label(status_frame, textvariable=self.val_status_var, foreground="gray").grid(row=0, column=0, sticky="w")
+
+        # Start validation button
+        ttk.Button(settings, text="Process Video", command=self._start_validation).grid(row=5, column=0, columnspan=3, padx=8, pady=12)
+
+        self._validation_thread = None
+        self._validation_model = None
+
+    def _pick_val_model(self):
+        path = filedialog.askopenfilename(
+            title="Select model engine file",
+            filetypes=[("Engine files", "*.engine"), ("All files", "*.*")]
         )
-        note.pack(fill="x", padx=8, pady=(0, 8))
+        if path:
+            self.val_model_var.set(path)
+
+    def _pick_val_video(self):
+        if cv2 is None:
+            messagebox.showerror("OpenCV missing", "Install opencv-python to use video validation.")
+            return
+        path = filedialog.askopenfilename(
+            title="Select test video",
+            filetypes=[("Video files", "*.mp4 *.avi *.mov *.mkv *.flv *.wmv"), ("All files", "*.*")]
+        )
+        if path:
+            self.val_video_var.set(path)
+
+    def _pick_val_output(self):
+        path = filedialog.asksaveasfilename(
+            title="Save output video",
+            defaultextension=".mp4",
+            filetypes=[("MP4 files", "*.mp4"), ("AVI files", "*.avi"), ("All files", "*.*")]
+        )
+        if path:
+            self.val_output_var.set(path)
+
+    def _start_validation(self):
+        if RFDETRBase is None:
+            messagebox.showerror("RFDETR missing", "Could not import RFDETR. Please ensure rfdetr is installed.")
+            return
+        if cv2 is None:
+            messagebox.showerror("OpenCV missing", "Install opencv-python to use video validation.")
+            return
+
+        model_path = self.val_model_var.get().strip()
+        video_path = self.val_video_var.get().strip()
+        output_path = self.val_output_var.get().strip()
+
+        if not model_path or not os.path.exists(model_path):
+            messagebox.showwarning("Invalid model", "Please select a valid model engine file.")
+            return
+        if not video_path or not os.path.exists(video_path):
+            messagebox.showwarning("Invalid video", "Please select a valid test video file.")
+            return
+        if not output_path:
+            messagebox.showwarning("Invalid output", "Please specify an output video path.")
+            return
+
+        conf_threshold = float(self.val_conf_var.get())
+
+        if self._validation_thread and self._validation_thread.is_alive():
+            messagebox.showinfo("Processing in progress", "Validation is already running.")
+            return
+
+        def validation_worker():
+            try:
+                self.after(0, lambda: self.val_status_var.set("Loading model..."))
+                self.after(0, lambda: self._status.set("Loading RF-DETR model..."))
+
+                # Load model (assuming RFDETRBase can load from engine file)
+                # Note: This may need adjustment based on actual RFDETR API
+                model = RFDETRBase()
+                if hasattr(model, 'load_engine'):
+                    model.load_engine(model_path)
+                elif hasattr(model, 'load'):
+                    model.load(model_path)
+                else:
+                    # Try to initialize with engine path
+                    model = RFDETRBase(model_path=model_path)
+
+                self.after(0, lambda: self.val_status_var.set("Processing video..."))
+                self.after(0, lambda: self._status.set("Processing video with detections..."))
+
+                # Open video
+                cap = cv2.VideoCapture(video_path)
+                if not cap.isOpened():
+                    raise Exception("Failed to open video file")
+
+                fps = int(cap.get(cv2.CAP_PROP_FPS))
+                width = int(cap.get(cv2.CAP_PROP_FRAME_WIDTH))
+                height = int(cap.get(cv2.CAP_PROP_FRAME_HEIGHT))
+                total_frames = int(cap.get(cv2.CAP_PROP_FRAME_COUNT))
+
+                # Create video writer
+                fourcc = cv2.VideoWriter_fourcc(*'mp4v')
+                out = cv2.VideoWriter(output_path, fourcc, fps, (width, height))
+
+                frame_num = 0
+                while True:
+                    ret, frame = cap.read()
+                    if not ret:
+                        break
+
+                    frame_num += 1
+                    self.after(0, lambda n=frame_num, t=total_frames: self.val_status_var.set(f"Processing frame {n}/{t}..."))
+
+                    # Run inference
+                    # Convert BGR to RGB for model
+                    frame_rgb = cv2.cvtColor(frame, cv2.COLOR_BGR2RGB)
+                    
+                    # Run prediction (adjust based on actual RFDETR API)
+                    try:
+                        if hasattr(model, 'predict'):
+                            results = model.predict(frame_rgb, conf=conf_threshold)
+                        elif hasattr(model, 'inference'):
+                            results = model.inference(frame_rgb, conf=conf_threshold)
+                        else:
+                            # Fallback: assume model returns detections in standard format
+                            results = model(frame_rgb)
+                        
+                        # Draw detections on frame
+                        # Adjust based on actual result format
+                        if hasattr(results, 'boxes'):
+                            boxes = results.boxes
+                            if hasattr(boxes, 'xyxy'):
+                                xyxy = boxes.xyxy.cpu().numpy() if hasattr(boxes.xyxy, 'cpu') else boxes.xyxy
+                                conf = boxes.conf.cpu().numpy() if hasattr(boxes.conf, 'cpu') else boxes.conf
+                                cls = boxes.cls.cpu().numpy() if hasattr(boxes.cls, 'cpu') else boxes.cls
+                                
+                                for i, (x1, y1, x2, y2) in enumerate(xyxy):
+                                    if conf[i] >= conf_threshold:
+                                        cv2.rectangle(frame, (int(x1), int(y1)), (int(x2), int(y2)), (0, 255, 0), 2)
+                                        label_text = f"Class {int(cls[i])}: {conf[i]:.2f}"
+                                        cv2.putText(frame, label_text, (int(x1), int(y1) - 10),
+                                                   cv2.FONT_HERSHEY_SIMPLEX, 0.5, (0, 255, 0), 2)
+                        elif isinstance(results, (list, tuple)) and len(results) > 0:
+                            # Handle list/tuple format
+                            for det in results:
+                                if len(det) >= 6:  # x1, y1, x2, y2, conf, cls
+                                    x1, y1, x2, y2, conf, cls = det[:6]
+                                    if conf >= conf_threshold:
+                                        cv2.rectangle(frame, (int(x1), int(y1)), (int(x2), int(y2)), (0, 255, 0), 2)
+                                        label_text = f"Class {int(cls)}: {conf:.2f}"
+                                        cv2.putText(frame, label_text, (int(x1), int(y1) - 10),
+                                                   cv2.FONT_HERSHEY_SIMPLEX, 0.5, (0, 255, 0), 2)
+                    except Exception as e:
+                        # If inference fails, just write the original frame
+                        pass
+
+                    out.write(frame)
+
+                cap.release()
+                out.release()
+
+                self.after(0, lambda: self.val_status_var.set(f"Validation complete! Output saved to: {output_path}"))
+                self.after(0, lambda: self._status.set("Validation completed successfully."))
+                self.after(0, lambda: messagebox.showinfo("Validation Complete", f"Processed video saved to:\n{output_path}"))
+            except Exception as e:
+                self.after(0, lambda: self.val_status_var.set(f"Validation failed: {str(e)}"))
+                self.after(0, lambda: self._status.set("Validation failed."))
+                self.after(0, lambda: messagebox.showerror("Validation Error", f"An error occurred during validation:\n{str(e)}"))
+
+        self._validation_thread = threading.Thread(target=validation_worker, daemon=True)
+        self._validation_thread.start()
+
+    def _build_albu_transform(self, target_size: int) -> A.Compose:
+        # Internal boxes are stored as pascal_voc absolute pixels already.
+        # Albumentations requires bbox_params with format + label_fields to keep labels aligned. [web:29]
+        t = []
+
+        if self.albu_color.get():
+            t += [
+                A.OneOf([
+                    A.RandomBrightnessContrast(p=1.0),
+                    A.HueSaturationValue(p=1.0),
+                    A.RandomGamma(p=1.0),
+                    A.CLAHE(p=1.0),
+                    A.RGBShift(p=1.0),
+                ], p=0.8),
+            ]
+
+        if self.albu_noise_blur.get():
+            t += [
+                A.OneOf([
+                    A.GaussNoise(p=1.0),
+                    A.ISONoise(p=1.0),
+                    A.MotionBlur(p=1.0),
+                    A.GaussianBlur(p=1.0),
+                    A.ImageCompression(quality_range=(35, 95), p=1.0),
+                ], p=0.6),
+            ]
+
+        if self.albu_geom.get():
+            t += [
+                A.HorizontalFlip(p=0.5),
+                A.VerticalFlip(p=0.1),
+                A.ShiftScaleRotate(shift_limit=0.05, scale_limit=0.2, rotate_limit=20, border_mode=0, p=0.7),
+                A.Perspective(scale=(0.02, 0.08), p=0.25),
+            ]
+
+        # Safer bbox-aware crops (avoid RandomCrop dropping everything). [web:29]
+        if self.albu_safe_crop.get():
+            t += [
+                A.RandomSizedBBoxSafeCrop(
+                    height=target_size,
+                    width=target_size,
+                    erosion_rate=0.1,
+                    p=0.35,
+                )
+            ]
+        else:
+            t += [A.LongestMaxSize(max_size=target_size, p=1.0), A.PadIfNeeded(target_size, target_size, p=1.0)]
+
+        if self.albu_dropout.get():
+            t += [
+                A.CoarseDropout(
+                    num_holes_range=(1, 8),
+                    hole_height_range=(0.05, 0.25),
+                    hole_width_range=(0.05, 0.25),
+                    fill=0,
+                    p=0.3,
+                )
+            ]
+
+        # IMPORTANT: Mosaic needs extra images passed in via metadata at call time. [web:24]
+        if self.albu_mosaic.get():
+            gy = int(self.albu_mosaic_gy.get())
+            gx = int(self.albu_mosaic_gx.get())
+            p = float(self.albu_mosaic_p.get())
+            t = [
+                A.Mosaic(
+                    grid_yx=(gy, gx),
+                    target_size=(target_size, target_size),
+                    fit_mode="contain",
+                    metadata_key="mosaic_metadata",
+                    p=p,
+                )
+            ] + t
+
+        return A.Compose(
+            t,
+            bbox_params=A.BboxParams(
+                format="pascal_voc",
+                label_fields=["bbox_labels"],
+                min_visibility=0.0,
+            ),
+            p=1.0,
+        )
+
+
+    def _apply_albu(self, img_pil: Image.Image, boxes: List[Box], transform: A.Compose) -> Tuple[Image.Image, List[Box]]:
+        # Convert PIL->numpy (RGB)
+        img = np.array(img_pil)
+
+        bboxes = []
+        labels = []
+        for b in boxes:
+            x1, y1, x2, y2 = b.as_xyxy()
+            bboxes.append([float(x1), float(y1), float(x2), float(y2)])
+            labels.append(int(b.label))
+
+        # For Mosaic: pass additional examples through "mosaic_metadata". [web:24]
+        data = {"image": img, "bboxes": bboxes, "bbox_labels": labels}
+
+        if self.albu_mosaic.get():
+            # Need (gy*gx - 1) additional samples (approx); Albumentations example passes a list in metadata. [web:24]
+            gy = int(self.albu_mosaic_gy.get())
+            gx = int(self.albu_mosaic_gx.get())
+            need = max(0, gy * gx - 1)
+
+            # Sample labeled images (can include unlabeled too; labeled preferred for meaningful mosaic)
+            candidates = [it for it in self.images if it.boxes]
+            if len(candidates) >= need:
+                picked = random.sample(candidates, need)
+            else:
+                picked = random.choices(candidates if candidates else self.images, k=need)
+
+            meta = []
+            for it in picked:
+                im = Image.open(it.path).convert("RGB")
+                arr = np.array(im)
+                bb = []
+                ll = []
+                for bx in [b for b in it.boxes if b.kind != "prompt"]:
+                    x1, y1, x2, y2 = bx.as_xyxy()
+                    bb.append([float(x1), float(y1), float(x2), float(y2)])
+                    ll.append(int(bx.label))
+                meta.append({"image": arr, "bboxes": bb, "bbox_labels": ll})
+
+            data["mosaic_metadata"] = meta
+
+        out = transform(**data)
+
+        out_img = Image.fromarray(out["image"])
+        out_boxes = []
+        for (x1, y1, x2, y2), lab in zip(out["bboxes"], out["bbox_labels"]):
+            out_boxes.append(Box(float(x1), float(y1), float(x2), float(y2), int(lab), kind="auto"))
+
+        return out_img, out_boxes
 
     def _pick_out_folder(self):
         d = filedialog.askdirectory(title="Select export folder")
@@ -900,37 +1597,23 @@ class App(tk.Tk):
         ensure_dir(out_dir)
 
         fmt = self.format_var.get()
-        if fmt not in ("yolo", "coco", "voc"):
-            messagebox.showerror("Format", f"Unknown format: {fmt}")
-            return
-
-        # Build augmentation plan
-        aug_ops = []
-        if self.aug_hflip.get():
-            aug_ops.append(("hflip",))
-        if self.aug_vflip.get():
-            aug_ops.append(("vflip",))
-        if self.aug_rot90.get():
-            aug_ops.append(("rot90",))
-        if self.aug_rot180.get():
-            aug_ops.append(("rot180",))
-        if self.aug_rot270.get():
-            aug_ops.append(("rot270",))
-        if self.aug_bright.get():
-            aug_ops.append(("bright", float(self.bright_factor_var.get())))
-
-        # Export
         try:
             if fmt == "yolo":
-                self._export_yolo(out_dir, aug_ops)
+                # new path: albumentations handled inside _export_yolo
+                self._export_yolo(out_dir, aug_ops=None)
             elif fmt == "coco":
-                self._export_coco(out_dir, aug_ops)
+                self._export_coco(out_dir, aug_ops=None)
+            elif fmt == "voc":
+                self._export_voc(out_dir, aug_ops=None)
             else:
-                self._export_voc(out_dir, aug_ops)
+                messagebox.showerror("Format", f"Unknown format: {fmt}")
+                return
+
             self._status.set(f"Exported dataset to: {out_dir}")
             messagebox.showinfo("Export", f"Export complete:\n{out_dir}")
         except Exception as e:
             messagebox.showerror("Export error", str(e))
+
 
     def _iter_augmented_samples(self, item: ImageItem, base_img: Image.Image, boxes: List[Box], aug_ops):
         """
@@ -938,6 +1621,10 @@ class App(tk.Tk):
         Always yields original as suffix="" first.
         """
         yield "", base_img, boxes
+
+        # If aug_ops is None or empty, only yield the original
+        if aug_ops is None:
+            return
 
         w, h = base_img.size
 
@@ -973,89 +1660,165 @@ class App(tk.Tk):
                 img2 = ImageEnhance.Brightness(base_img).enhance(factor)
                 yield f"_bright{factor:g}", img2, boxes
 
-    def _export_yolo(self, out_dir: str, aug_ops):
+    def _export_yolo(self, out_dir: str, _unused_aug_ops):
         images_dir = os.path.join(out_dir, "images")
         labels_dir = os.path.join(out_dir, "labels")
         ensure_dir(images_dir)
         ensure_dir(labels_dir)
 
-        # classes.txt (optional helper)
         used_labels = sorted({b.label for it in self.images for b in it.boxes if b.kind != "prompt"})
         with open(os.path.join(out_dir, "classes.txt"), "w", encoding="utf-8") as f:
             for lab in used_labels:
                 f.write(f"{lab}\n")
 
+        target_size = int(self.albu_mosaic_ts.get())
+        copies = max(0, int(self.albu_copies.get()))
+        use_albu = bool(self.albu_enable.get())
+
+        albu_t = self._build_albu_transform(target_size) if use_albu else None
+
         for item in self.images:
             base = Image.open(item.path).convert("RGB")
-            boxes = [b for b in item.boxes if b.kind != "prompt"]
+            base_boxes = [b for b in item.boxes if b.kind != "prompt"]
 
             stem = os.path.splitext(os.path.basename(item.path))[0]
-            for suffix, img2, b2 in self._iter_augmented_samples(item, base, boxes, aug_ops):
-                out_img = os.path.join(images_dir, f"{stem}{suffix}.jpg")
-                img2.save(out_img, quality=95)
 
-                w, h = img2.size
-                out_lbl = os.path.join(labels_dir, f"{stem}{suffix}.txt")
-                with open(out_lbl, "w", encoding="utf-8") as f:
-                    for b in b2:
-                        x1, y1, x2, y2 = b.as_xyxy()
-                        cx, cy, bw, bh = yolo_xyxy_to_yolo_txt(x1, y1, x2, y2, w, h)
-                        # label is numeric as requested
-                        f.write(f"{b.label} {cx:.6f} {cy:.6f} {bw:.6f} {bh:.6f}\n")
+            # Always export original once
+            self._write_yolo_sample(images_dir, labels_dir, stem, "", base, base_boxes)
+
+            # Albumentations augmented copies
+            if use_albu and albu_t is not None:
+                for k in range(copies):
+                    img2, b2 = self._apply_albu(base, base_boxes, albu_t)
+                    self._write_yolo_sample(images_dir, labels_dir, stem, f"_albu{k:03d}", img2, b2)
+
+
+    def _write_yolo_sample(self, images_dir, labels_dir, stem, suffix, img_pil, boxes):
+        out_img = os.path.join(images_dir, f"{stem}{suffix}.jpg")
+        img_pil.save(out_img, quality=95)
+
+        w, h = img_pil.size
+        out_lbl = os.path.join(labels_dir, f"{stem}{suffix}.txt")
+        with open(out_lbl, "w", encoding="utf-8") as f:
+            for b in boxes:
+                x1, y1, x2, y2 = b.as_xyxy()
+                cx, cy, bw, bh = yolo_xyxy_to_yolo_txt(x1, y1, x2, y2, w, h)
+                f.write(f"{b.label} {cx:.6f} {cy:.6f} {bw:.6f} {bh:.6f}\n")
+
 
     def _export_coco(self, out_dir: str, aug_ops):
-        images_dir = os.path.join(out_dir, "images")
-        ensure_dir(images_dir)
+        # RFDETR expects train, valid, and test subdirectories
+        train_dir = os.path.join(out_dir, "train")
+        valid_dir = os.path.join(out_dir, "valid")
+        test_dir = os.path.join(out_dir, "test")
+        
+        train_images_dir = os.path.join(train_dir, "images")
+        valid_images_dir = os.path.join(valid_dir, "images")
+        test_images_dir = os.path.join(test_dir, "images")
+        
+        ensure_dir(train_images_dir)
+        ensure_dir(valid_images_dir)
+        ensure_dir(test_images_dir)
 
         used_labels = sorted({b.label for it in self.images for b in it.boxes if b.kind != "prompt"})
         label_to_catid = {lab: i + 1 for i, lab in enumerate(used_labels)}
 
-        coco = {
-            "info": {"description": "Exported by YOLOE Dataset Labeler"},
-            "licenses": [],
-            "categories": [{"id": label_to_catid[lab], "name": str(lab)} for lab in used_labels],
-            "images": [],
-            "annotations": [],
-        }
+        # Create base category structure
+        categories = [
+            {
+                "id": label_to_catid[lab],
+                "name": str(lab),
+                "supercategory": "none"  # COCO format requires supercategory field
+            }
+            for lab in used_labels
+        ]
 
-        ann_id = 1
-        img_id = 1
+        # Split dataset: 70% train, 20% valid, 10% test
+        all_items = list(self.images)
+        random.shuffle(all_items)
+        total = len(all_items)
+        train_end = int(total * 0.7)
+        valid_end = int(total * 0.9)
+        
+        train_items = all_items[:train_end]
+        valid_items = all_items[train_end:valid_end]
+        test_items = all_items[valid_end:]
 
-        for item in self.images:
-            base = Image.open(item.path).convert("RGB")
-            boxes = [b for b in item.boxes if b.kind != "prompt"]
+        # Helper function to create COCO structure for a split
+        def create_coco_split(items, split_name):
+            coco = {
+                "info": {"description": f"Exported by YOLOE Dataset Labeler - {split_name}"},
+                "licenses": [],
+                "categories": categories,
+                "images": [],
+                "annotations": [],
+            }
+            
+            ann_id = 1
+            img_id = 1
+            
+            for item in items:
+                base = Image.open(item.path).convert("RGB")
+                boxes = [b for b in item.boxes if b.kind != "prompt"]
 
-            stem = os.path.splitext(os.path.basename(item.path))[0]
-            for suffix, img2, b2 in self._iter_augmented_samples(item, base, boxes, aug_ops):
-                out_name = f"{stem}{suffix}.jpg"
-                out_img = os.path.join(images_dir, out_name)
-                img2.save(out_img, quality=95)
-                w, h = img2.size
+                stem = os.path.splitext(os.path.basename(item.path))[0]
+                for suffix, img2, b2 in self._iter_augmented_samples(item, base, boxes, aug_ops):
+                    out_name = f"{stem}{suffix}.jpg"
+                    
+                    # Determine which images directory to use
+                    if split_name == "train":
+                        images_dir = train_images_dir
+                    elif split_name == "valid":
+                        images_dir = valid_images_dir
+                    else:  # test
+                        images_dir = test_images_dir
+                    
+                    out_img = os.path.join(images_dir, out_name)
+                    img2.save(out_img, quality=95)
+                    w, h = img2.size
 
-                coco["images"].append({
-                    "id": img_id,
-                    "file_name": out_name,
-                    "width": w,
-                    "height": h,
-                })
-
-                for b in b2:
-                    x1, y1, x2, y2 = b.as_xyxy()
-                    bw = x2 - x1
-                    bh = y2 - y1
-                    coco["annotations"].append({
-                        "id": ann_id,
-                        "image_id": img_id,
-                        "category_id": label_to_catid[b.label],
-                        "bbox": [float(x1), float(y1), float(bw), float(bh)],
-                        "area": float(bw * bh),
-                        "iscrowd": 0,
+                    # COCO format: file_name should be relative to the root directory
+                    # If root is train/, then file_name should be "images/filename.jpg"
+                    coco["images"].append({
+                        "id": img_id,
+                        "file_name": os.path.join("images", out_name),
+                        "width": w,
+                        "height": h,
                     })
-                    ann_id += 1
-                img_id += 1
 
-        with open(os.path.join(out_dir, "annotations.coco.json"), "w", encoding="utf-8") as f:
-            json.dump(coco, f, indent=2)
+                    for b in b2:
+                        x1, y1, x2, y2 = b.as_xyxy()
+                        bw = x2 - x1
+                        bh = y2 - y1
+                        coco["annotations"].append({
+                            "id": ann_id,
+                            "image_id": img_id,
+                            "category_id": label_to_catid[b.label],
+                            "bbox": [float(x1), float(y1), float(bw), float(bh)],
+                            "area": float(bw * bh),
+                            "iscrowd": 0,
+                        })
+                        ann_id += 1
+                    img_id += 1
+            
+            return coco
+
+        # Create splits
+        train_coco = create_coco_split(train_items, "train")
+        valid_coco = create_coco_split(valid_items, "valid")
+        test_coco = create_coco_split(test_items, "test")
+
+        # Save annotation files
+        train_annotations_path = os.path.join(train_dir, "_annotations.coco.json")
+        valid_annotations_path = os.path.join(valid_dir, "_annotations.coco.json")
+        test_annotations_path = os.path.join(test_dir, "_annotations.coco.json")
+        
+        with open(train_annotations_path, "w", encoding="utf-8") as f:
+            json.dump(train_coco, f, indent=2)
+        with open(valid_annotations_path, "w", encoding="utf-8") as f:
+            json.dump(valid_coco, f, indent=2)
+        with open(test_annotations_path, "w", encoding="utf-8") as f:
+            json.dump(test_coco, f, indent=2)
 
     def _export_voc(self, out_dir: str, aug_ops):
         import xml.etree.ElementTree as ET
@@ -1138,6 +1901,7 @@ class App(tk.Tk):
     def on_close(self):
         self._cam_running = False
         self._stop_autolabel = True
+        self._stop_training = True
         self.destroy()
 
 
