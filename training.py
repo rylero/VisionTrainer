@@ -29,12 +29,22 @@ def convert_onnx_to_engine(onnx_path, engine_path, workspace_size=4096):
         # Standard trtexec command
         # --fp16: Use FP16 precision for better performance on supported GPUs
         # --memPoolSize=workspace:N: Set max workspace size
+        # --useCudaGraph: Use CUDA Graph for better performance
+        # --useSpinWait: Use spin wait for better performance
+        # --warmUp=500: Warm up the model for 500 iterations
+        # --avgRuns=1000: Average the results over 1000 runs
+        # --duration=10: Run for 10 seconds
         command = [
             "trtexec",
             f"--onnx={onnx_path}",
             f"--saveEngine={engine_path}",
             "--fp16",
-            f"--memPoolSize=workspace:{workspace_size}"
+            f"--memPoolSize=workspace:{workspace_size}",
+            "--useCudaGraph",
+            "--useSpinWait",
+            "--warmUp=500",
+            "--avgRuns=1000",
+            "--duration=10"
         ]
         
         logger.info(f"Running command: {' '.join(command)}")
@@ -119,37 +129,4 @@ def rfdetr_train(
     logger.info(f"Success! Final TensorRT engine saved at: {final_engine_path}")
     return final_engine_path
 
-def main():
-    parser = argparse.ArgumentParser(description="Train RF-DETR model and export to TensorRT .engine")
-    
-    # Dataset and Output paths
-    parser.add_argument("--dataset_path", type=str, required=True, help="Path to the COCO-formatted labeled dataset directory")
-    parser.add_argument("--output_dir", type=str, default="./models", help="Directory to save training artifacts and models")
-    parser.add_argument("--engine_output", type=str, default="trained_rfdetr.engine", help="Name of the final .engine file")
-    
-    # Hyperparameters
-    parser.add_argument("--epochs", type=int, default=100, help="Number of training epochs")
-    parser.add_argument("--batch_size", type=int, default=4, help="Training batch size")
-    parser.add_argument("--grad_accum_steps", type=int, default=4, help="Gradient accumulation steps")
-    parser.add_argument("--lr", type=float, default=1e-4, help="Learning rate")
-    parser.add_argument("--workspace_size", type=int, default=4096, help="TensorRT workspace size in MB")
-    
-    args = parser.parse_args()
-
-    try:
-        rfdetr_train(
-            dataset_path=args.dataset_path,
-            output_dir=args.output_dir,
-            engine_output=args.engine_output,
-            epochs=args.epochs,
-            batch_size=args.batch_size,
-            grad_accum_steps=args.grad_accum_steps,
-            lr=args.lr,
-            workspace_size=args.workspace_size
-        )
-    except Exception:
-        sys.exit(1)
-
-if __name__ == "__main__":
-    main()
 
